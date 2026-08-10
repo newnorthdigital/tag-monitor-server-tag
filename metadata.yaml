@@ -1,5 +1,5 @@
 homepage: "https://monitor.newnorth.nl"
 documentation: "https://github.com/newnorthdigital/tag-monitor-server-tag/blob/main/README.md"
 versions:
-  - sha: 8a198a8b0098fba9c01149a4646a175b4c8c61ab
+  - sha: 62dfb31f6abf6ce085972fa651fba0b20d8ac74a
     changeNotes: "Initial release."
