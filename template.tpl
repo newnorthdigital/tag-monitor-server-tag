@@ -60,7 +60,11 @@ ___TEMPLATE_PARAMETERS___
     "defaultValue": "100",
     "valueValidators": [
       {
-        "type": "POSITIVE_NUMBER"
+        "type": "NON_EMPTY"
+      },
+      {
+        "type": "REGEX",
+        "args": ["^([1-9][0-9]?|100)$"]
       }
     ],
     "help": "Percentage of events that report telemetry (1-100). Server volumes are usually low enough to report every event."
@@ -77,6 +81,7 @@ ___TEMPLATE_PARAMETERS___
     "type": "SIMPLE_TABLE",
     "name": "customRequired",
     "displayName": "Extra requirements (optional)",
+    "help": "Extra required parameters per event, on top of the built-in GA4 ecommerce checks. One row per event name, parameters comma-separated. Only the NAMES of missing parameters are reported, never their values.",
     "simpleTableColumns": [
       {
         "defaultValue": "",
@@ -520,11 +525,11 @@ Tag Monitor (server leg). Reports per-tag execution telemetry to a
 configurable HTTPS endpoint. No personal data is collected: only tag ids,
 names, execution status, timing and consent state.
 Fork of Simo Ahava's Server Container Monitor (Apache 2.0,
-gtm-templates-simo-ahava), rewired to POST to the NND ingest endpoint.
-Setup: import, set site token (same as the site's web container), trigger =
-Custom Event regex .*, set metadata exclude:true on this tag.
-Tag names come from the GTM API sync, so per-tag metadata is not needed.
-Upgrading from v1: "Report missing required parameters" defaults to on for
-new tags only. An existing tag keeps no stored value, so open it once and
-save to activate the parameter check.
+gtm-templates-simo-ahava), rewired to POST JSON to a configurable endpoint.
+Setup: create a tag from the template, use the same site token as the site's
+web container, and fire it on a Custom Event trigger matching .* (regex). Add
+tag metadata exclude = true on this tag itself so it does not report on its
+own runs. gtmOnSuccess is called before the HTTP request on purpose, so
+monitoring never delays the container's response to the visitor.
+The parameter check reports only the NAMES of missing fields, never values.
 Created by Freek Kampen, New North Digital.
