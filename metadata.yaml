@@ -3,3 +3,5 @@ documentation: "https://github.com/newnorthdigital/tag-monitor-server-tag/blob/m
 versions:
   - sha: 62dfb31f6abf6ce085972fa651fba0b20d8ac74a
     changeNotes: "Initial release."
+  - sha: 9eb352a561d6c188ebb017d53bd19cb8b27c40b9
+    changeNotes: "Absent endpoint falls back to the default collector instead of a relative URL."
