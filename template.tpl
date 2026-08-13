@@ -297,7 +297,7 @@ addEventCallback((containerId, eventData) => {
   }
 
   debugLog('reporting ' + tags.length + ' tags for event ' + eventName);
-  sendHttpRequest(data.endpoint, (statusCode) => {
+  sendHttpRequest(data.endpoint || 'https://monitor.newnorth.nl/api/e', (statusCode) => {
     // Error log is unconditional and the logging permission is set to "all":
     // a failure that only logs in preview is invisible exactly when it matters.
     if (statusCode >= 400 || statusCode <= 0) {
