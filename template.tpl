@@ -158,6 +158,14 @@ const debugLog = (msg) => {
 };
 
 
+// A tag updated across template versions can run with new fields absent
+// (defaults fill the editor only). Without a token the beacon is junk the
+// ingest rejects; better not to send it at all.
+if (!data.siteToken) {
+  data.gtmOnSuccess();
+  return;
+}
+
 const sampleRate = makeInteger(data.sampleRate) || 100;
 if (generateRandom(1, 100) > sampleRate) {
   data.gtmOnSuccess();
@@ -191,7 +199,8 @@ const REQUIRED = {
 };
 
 const missingParams = () => {
-  if (!data.checkParams || eventName === '') return '';
+  const NONE = { missing: '', found: '' };
+  if (!data.checkParams || eventName === '') return NONE;
 
   let required = REQUIRED[eventName];
   // Only accept a real array: event_name is attacker-controlled, and indexing
@@ -202,11 +211,22 @@ const missingParams = () => {
     const extra = makeString(custom[eventName]).split(',');
     required = required ? required.concat(extra) : extra;
   }
-  if (!required || required.length === 0) return '';
+  if (!required || required.length === 0) return NONE;
 
   const all = getAllEventData();
   const ecommerce = getType(all.ecommerce) === 'object' ? all.ecommerce : {};
   const missing = [];
+  // Every user_data field name this template is willing to name out loud, in
+  // the three shapes seen in the wild: GA4's uid-data reference, the Google
+  // Ads user-provided-data variable, and the flat object a hand-built Shopify
+  // custom pixel tends to push.
+  const USER_DATA_NAMES = [
+    'email', 'email_address', 'sha256_email', 'sha256_email_address',
+    'phone', 'phone_number', 'sha256_phone', 'sha256_phone_number',
+    'address', 'first_name', 'last_name', 'street', 'city', 'region',
+    'postal_code', 'zip', 'country'
+  ];
+  const found = [];
   for (let i = 0; i < required.length; i++) {
     const key = makeString(required[i]).trim();
     if (key === '') continue;
@@ -228,10 +248,48 @@ const missingParams = () => {
   // hashed or not, and must never leave the container.
   if (eventName === 'purchase' || eventName === 'generate_lead') {
     const ud = getType(all.user_data) === 'object' ? all.user_data : {};
-    const present = (a, b) => getType(ud[a]) !== 'undefined' || getType(ud[b]) !== 'undefined';
-    if (!present('sha256_email_address', 'email_address')) missing.push('user_data.email');
-    if (!present('sha256_phone_number', 'phone_number')) missing.push('user_data.phone');
+    // TWO SHAPES, both of which really arrive, and checking only one reports a
+    // field that is sitting right there. GA4's uid-data reference names the
+    // fields email_address and phone_number; the Google Ads user-provided-data
+    // variable, which is what a "manual mode" enhanced-conversions setup sends,
+    // names them email and phone_number and indexes address by position.
+    // One2Track's purchases carry user_data.email on every order and were
+    // reported as carrying no email address at all for a month, which is the
+    // worst kind of finding this product can produce: a real setup called
+    // broken. Verified against a Tag Assistant export of both containers.
+    const has = (names) => {
+      for (let i = 0; i < names.length; i++) {
+        const v = ud[names[i]];
+        if (getType(v) !== 'undefined' && v !== null && v !== '') return true;
+      }
+      return false;
+    };
+    if (!has(['email_address', 'sha256_email_address', 'email', 'sha256_email'])) {
+      missing.push('user_data.email');
+    }
+    if (!has(['phone_number', 'sha256_phone_number', 'phone', 'sha256_phone'])) {
+      missing.push('user_data.phone');
+    }
     if (getType(ud.address) === 'undefined') missing.push('user_data.address');
+
+    // The NAMES of the user_data fields that ARE there, reported beside the
+    // ones that are not. It exists so a shape we have not met cannot be read
+    // as an empty one ever again: "phone is missing" beside "email, address
+    // and first_name were present" is a finding, where "phone is missing" on
+    // its own was, for a month, an accusation.
+    //
+    // Names only, never values, exactly as the missing list works. The list is
+    // a fixed allowlist rather than Object.keys(user_data) on purpose: a
+    // container may put anything at all under user_data, including an order
+    // note or a customer id, and this must never forward a field name nobody
+    // here chose to forward.
+    for (let p = 0; p < USER_DATA_NAMES.length; p++) {
+      const field = USER_DATA_NAMES[p];
+      const val = ud[field];
+      if (getType(val) !== 'undefined' && val !== null && val !== '') {
+        found.push('user_data.' + field);
+      }
+    }
   }
 
   const items = getType(all.items) === 'array' ? all.items : ecommerce.items;
@@ -243,10 +301,16 @@ const missingParams = () => {
       if (!hasId && !hasName) missing.push('items.item_id');
     }
   }
-  return missing.join(',');
+  // `found` only rides along when something is missing: a complete event
+  // writes no param_issues row at all, and this must not start creating them.
+  // The whole point of the list is to explain a missing one.
+  return {
+    missing: missing.join(','),
+    found: missing.length > 0 ? found.join(',') : '',
+  };
 };
 
-const missing = missingParams();
+const params = missingParams();
 
 // Amounts are opt-in: they turn a count into something a client can weigh,
 // but they are their commercial figures, so nobody sends them by accident.
@@ -266,6 +330,28 @@ const eventCurrency = () => {
 };
 const value = eventValue();
 const currency = eventCurrency();
+
+// Consent as it arrived at the container.
+//
+// The server leg has never carried consent at all, so "do the server-side tags
+// fire for visitors who refused" has only ever been answerable by hand, one
+// site at a time. On doloris the answer turned out to be yes: the Meta and
+// TikTok tags ran on 100% of pageviews, denied included.
+//
+// GA4 encodes it in `gcs` as a G1xy string, x = ad_storage, y =
+// analytics_storage, 1 granted and 0 denied. The GA4 client surfaces it as
+// `x-ga-gcs`. Anything else, or a request from a client that does not pass it
+// through, yields an empty string and is stored as unknown rather than guessed
+// at: a wrong consent reading is worse here than no reading.
+const consentState = () => {
+  const gcs = makeString(getEventData('x-ga-gcs') || '');
+  if (gcs.length < 4 || gcs.substring(0, 2) !== 'G1') return '';
+  const ad = gcs.substring(2, 3);
+  const an = gcs.substring(3, 4);
+  if ((ad !== '0' && ad !== '1') || (an !== '0' && an !== '1')) return '';
+  return (ad === '1' ? 'g' : 'd') + (an === '1' ? 'g' : 'd');
+};
+const consent = consentState();
 
 addEventCallback((containerId, eventData) => {
   const tags = eventData.tags
@@ -288,9 +374,28 @@ addEventCallback((containerId, eventData) => {
     sr: sampleRate,
     tags: tags
   };
+  // Two characters, ad then analytics. Absent when the client did not pass a
+  // consent signal through, so "not measured" stays distinct from "denied".
+  if (consent !== '') body.gcs = consent;
+  // HOST ONLY, never the path or the query string.
+  //
+  // The hostname says which of a client's sites an event came from, which the
+  // monitor otherwise cannot tell: one container serves one2track.nl and
+  // one2track.de and every row looked identical. It also makes a domain move,
+  // a staging copy and a container running somewhere it should not be visible
+  // at all, none of which anything here could see before.
+  //
+  // The path is where the personal data lives (an order confirmation carries
+  // an order id, a search page carries what someone typed), so it is cut here
+  // rather than filtered later: a value that never leaves the container cannot
+  // leak from a table. Split on '/' rather than parsed, because sandboxed JS
+  // has no URL type and page_hostname is already a bare host in practice.
+  const host = makeString(getEventData('page_hostname') || '').split('/')[0].split('?')[0];
+  if (host !== '') body.h = host;
   // Only sent when something is actually missing, so the receiving side only
   // ever stores problem rows.
-  if (missing !== '') body.mp = missing;
+  if (params.missing !== '') body.mp = params.missing;
+  if (params.found !== '') body.pp = params.found;
   if (value > 0) {
     body.v = value;
     body.cur = currency;
@@ -456,6 +561,41 @@ scenarios:
     runCode(mockData);
     cb('GTM-SRV1', { tags: [ { id: 9, name: 'Monitor', status: 'success', executionTime: 1, exclude: 'true' } ]});
     assertApi('sendHttpRequest').wasNotCalled();
+- name: The hostname is sent, and only ever the host
+  code: |-
+    const JSON = require('JSON');
+    const mockData = { endpoint: 'https://example.com/collect', siteToken: 'nnd-dev-3f9a', sampleRate: '100' };
+    mock('generateRandom', (min, max) => 1);
+    // A path on the value must never survive: the path is where the personal
+    // data lives, an order id or a search term.
+    mock('getEventData', (key) => key === 'page_hostname'
+      ? 'www.one2track.de/checkout/thanks?order=12345'
+      : (key === 'event_name' ? 'page_view' : undefined));
+    mock('getClientName', () => 'GA4');
+    mock('getContainerVersion', () => ({ version: '7' }));
+    let cb;
+    mock('addEventCallback', (fn) => { cb = fn; });
+    let sentBody;
+    mock('sendHttpRequest', (url, callback, options, body) => { sentBody = body; callback(204, {}, ''); });
+    runCode(mockData);
+    cb('GTM-SRV1', { tags: [ { id: 3, name: 'Meta CAPI', status: 'success', executionTime: 5 } ]});
+    const parsed = JSON.parse(sentBody);
+    assertThat(parsed.h).isEqualTo('www.one2track.de');
+- name: No hostname is sent when the event carries none
+  code: |-
+    const JSON = require('JSON');
+    const mockData = { endpoint: 'https://example.com/collect', siteToken: 'nnd-dev-3f9a', sampleRate: '100' };
+    mock('generateRandom', (min, max) => 1);
+    mock('getEventData', (key) => key === 'event_name' ? 'page_view' : undefined);
+    mock('getClientName', () => 'GA4');
+    mock('getContainerVersion', () => ({ version: '7' }));
+    let cb;
+    mock('addEventCallback', (fn) => { cb = fn; });
+    let sentBody;
+    mock('sendHttpRequest', (url, callback, options, body) => { sentBody = body; callback(204, {}, ''); });
+    runCode(mockData);
+    cb('GTM-SRV1', { tags: [ { id: 3, name: 'Meta CAPI', status: 'success', executionTime: 5 } ]});
+    assertThat(JSON.parse(sentBody).h).isUndefined();
 - name: Incomplete purchase reports the missing parameters
   code: |-
     const JSON = require('JSON');
@@ -474,6 +614,95 @@ scenarios:
     const parsed = JSON.parse(sentBody);
     assertThat(parsed.mp).contains('transaction_id');
     assertThat(parsed.mp).contains('items');
+- name: The Google Ads user-provided-data shape is not reported as a missing email
+  code: |-
+    const JSON = require('JSON');
+    const mockData = { endpoint: 'https://example.com/collect', siteToken: 'nnd-dev-3f9a', sampleRate: '100', checkParams: true };
+    mock('generateRandom', (min, max) => 1);
+    mock('getEventData', (key) => 'purchase');
+    mock('getAllEventData', () => ({
+      event_name: 'purchase', transaction_id: 'T-1', value: 49.95, currency: 'EUR',
+      items: [{ item_id: 'SKU1' }],
+      user_data: { email: 'a@b.nl', address: { '0': { first_name: 'A', city: 'Amsterdam' } } }
+    }));
+    mock('getClientName', () => 'GA4');
+    mock('getContainerVersion', () => ({ version: '7' }));
+    let cb;
+    mock('addEventCallback', (fn) => { cb = fn; });
+    let sentBody;
+    mock('sendHttpRequest', (url, callback, options, body) => { sentBody = body; callback(204, {}, ''); });
+    runCode(mockData);
+    cb('GTM-SRV1', { tags: [ { id: 3, name: 'Meta CAPI', status: 'success', executionTime: 5 } ]});
+    const parsed = JSON.parse(sentBody);
+    assertThat(parsed.mp).doesNotContain('user_data.email');
+    assertThat(parsed.mp).contains('user_data.phone');
+- name: The fields that were present ride along with the ones that were not
+  code: |-
+    const JSON = require('JSON');
+    const mockData = { endpoint: 'https://example.com/collect', siteToken: 'nnd-dev-3f9a', sampleRate: '100', checkParams: true };
+    mock('generateRandom', (min, max) => 1);
+    mock('getEventData', (key) => 'purchase');
+    mock('getAllEventData', () => ({
+      event_name: 'purchase', transaction_id: 'T-1', value: 49.95, currency: 'EUR',
+      items: [{ item_id: 'SKU1' }],
+      user_data: { email_address: 'a@b.nl', city: 'Amsterdam' }
+    }));
+    mock('getClientName', () => 'GA4');
+    mock('getContainerVersion', () => ({ version: '7' }));
+    let cb;
+    mock('addEventCallback', (fn) => { cb = fn; });
+    let sentBody;
+    mock('sendHttpRequest', (url, callback, options, body) => { sentBody = body; callback(204, {}, ''); });
+    runCode(mockData);
+    cb('GTM-SRV1', { tags: [ { id: 3, name: 'Meta CAPI', status: 'success', executionTime: 5 } ]});
+    const parsed = JSON.parse(sentBody);
+    assertThat(parsed.pp).contains('user_data.email_address');
+    assertThat(parsed.pp).contains('user_data.city');
+- name: A complete event sends no present list, because it writes no row at all
+  code: |-
+    const JSON = require('JSON');
+    const mockData = { endpoint: 'https://example.com/collect', siteToken: 'nnd-dev-3f9a', sampleRate: '100', checkParams: true };
+    mock('generateRandom', (min, max) => 1);
+    mock('getEventData', (key) => 'purchase');
+    mock('getAllEventData', () => ({
+      event_name: 'purchase', transaction_id: 'T-1', value: 49.95, currency: 'EUR',
+      items: [{ item_id: 'SKU1' }],
+      user_data: { email: 'a@b.nl', phone_number: '+31600000000', address: { '0': { city: 'Amsterdam' } } }
+    }));
+    mock('getClientName', () => 'GA4');
+    mock('getContainerVersion', () => ({ version: '7' }));
+    let cb;
+    mock('addEventCallback', (fn) => { cb = fn; });
+    let sentBody;
+    mock('sendHttpRequest', (url, callback, options, body) => { sentBody = body; callback(204, {}, ''); });
+    runCode(mockData);
+    cb('GTM-SRV1', { tags: [ { id: 3, name: 'Meta CAPI', status: 'success', executionTime: 5 } ]});
+    const parsed = JSON.parse(sentBody);
+    assertThat(parsed.mp).isUndefined();
+    assertThat(parsed.pp).isUndefined();
+- name: A purchase carrying no user_data at all reports all three
+  code: |-
+    const JSON = require('JSON');
+    const mockData = { endpoint: 'https://example.com/collect', siteToken: 'nnd-dev-3f9a', sampleRate: '100', checkParams: true };
+    mock('generateRandom', (min, max) => 1);
+    mock('getEventData', (key) => 'purchase');
+    mock('getAllEventData', () => ({
+      event_name: 'purchase', transaction_id: 'T-1', value: 49.95, currency: 'EUR',
+      items: [{ item_id: 'SKU1' }]
+    }));
+    mock('getClientName', () => 'GA4');
+    mock('getContainerVersion', () => ({ version: '7' }));
+    let cb;
+    mock('addEventCallback', (fn) => { cb = fn; });
+    let sentBody;
+    mock('sendHttpRequest', (url, callback, options, body) => { sentBody = body; callback(204, {}, ''); });
+    runCode(mockData);
+    cb('GTM-SRV1', { tags: [ { id: 3, name: 'Meta CAPI', status: 'success', executionTime: 5 } ]});
+    const parsed = JSON.parse(sentBody);
+    assertThat(parsed.mp).contains('user_data.email');
+    assertThat(parsed.mp).contains('user_data.phone');
+    assertThat(parsed.mp).contains('user_data.address');
+    assertThat(parsed.pp).isUndefined();
 - name: Nested ecommerce parameters are not reported as missing
   code: |-
     const JSON = require('JSON');
@@ -482,7 +711,8 @@ scenarios:
     mock('getEventData', (key) => 'purchase');
     mock('getAllEventData', () => ({
       event_name: 'purchase',
-      ecommerce: { transaction_id: 'T-1', value: 49.95, currency: 'EUR', items: [{ item_id: 'SKU1' }] }
+      ecommerce: { transaction_id: 'T-1', value: 49.95, currency: 'EUR', items: [{ item_id: 'SKU1' }] },
+      user_data: { email: 'a@b.nl', phone_number: '+31600000000', address: { '0': { city: 'Amsterdam' } } }
     }));
     mock('getClientName', () => 'Data Client');
     mock('getContainerVersion', () => ({ version: '7' }));
@@ -501,7 +731,8 @@ scenarios:
     mock('getEventData', (key) => 'purchase');
     mock('getAllEventData', () => ({
       event_name: 'purchase', transaction_id: 'T-1', value: 49.95, currency: 'EUR',
-      items: [{ item_id: 'SKU1' }]
+      items: [{ item_id: 'SKU1' }],
+      user_data: { email: 'a@b.nl', phone_number: '+31600000000', address: { '0': { city: 'Amsterdam' } } }
     }));
     mock('getClientName', () => 'GA4');
     mock('getContainerVersion', () => ({ version: '7' }));
